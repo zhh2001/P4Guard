@@ -14,8 +14,32 @@
 typedef bit<8>  wid_t
 typedef bit<32> instanceType_t
 
+typedef bit<8>        ID_t;
+typedef bit<64>       packetCount_t;
+typedef bit<48>       timestamp_t;
+typedef bit<8>        tokenCalculateStrategy_t;
+typedef bit<8>        controlBehavior_t;
+typedef packetCount_t threshold_t;
+typedef timestamp_t   warmUpPeriodSec_t;
+typedef bit<16>       warmUpColdFactor_t;
+typedef timestamp_t   statIntervalInMs_t;
+
 const instanceType_t INSTANCE_TYPE_NORMAL = 0;
 const instanceType_t INSTANCE_TYPE_CLONE  = 1;
+
+const tokenCalculateStrategy_t STRATEGY_DIRECT  = 1;
+const tokenCalculateStrategy_t STRATEGY_WARM_UP = 2;
+
+const controlBehavior_t BEHAVIOR_REJECT     = 1;
+const controlBehavior_t BEHAVIOR_THROTTLING = 2;
+
+register<packetCount_t, ID_t>(2 << 8) passed;
+register<packetCount_t, ID_t>(2 << 8) blocked;
+register<timestamp_t, ID_t>(2 << 8)   timestamp;
+
+register<threshold_t, ID_t>(2 << 8) warm_up_threshold;         // 预热模式下的真实阈值
+register<timestamp_t, ID_t>(2 << 8) warm_up_update_timestamp;  // 更新预热阈值的时间
+register<timestamp_t, ID_t>(2 << 8) warm_up_ms_per_threshold;  // 预热/冷启动后每多少微秒后增加一个阈值
 
 // 观察窗口参数
 register<bit<5>>(1) log2_m;
@@ -107,6 +131,18 @@ register<bit<8>>(1) k;      // 定点表示：5 个整数位，3 个小数位
 
 // 防御就绪状态
 register<bit<8>>(1) dr_state;
+
+
+struct reported_data {
+    packetCount_t passed;
+    packetCount_t blocked;
+}
+
+struct warm_up_data {
+    threshold_t threshold;
+    packetCount_t passed;
+    packetCount_t blocked;
+}
 
 
 const bit<32> HASH_BASE = 32w0x0

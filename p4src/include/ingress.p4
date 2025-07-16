@@ -22,6 +22,114 @@ control MyIngress(inout headers hdr,
         hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
     }
 
+    action flow_control(
+        ID_t                     id,
+        tokenCalculateStrategy_t tokenCalculateStrategy,
+        controlBehavior_t        controlBehavior,
+        threshold_t              threshold,
+        warmUpPeriodSec_t        warmUpPeriodSec,
+        warmUpColdFactor_t       warmUpColdFactor,
+        statIntervalInMs_t       statIntervalInMs
+    ) {
+        packetCount_t passed_count;
+        passed.read(passed_count, id);
+
+        packetCount_t blocked_count;
+        blocked.read(blocked_count, id);
+
+        timestamp_t start_timestamp;
+        timestamp.read(start_timestamp, id);
+
+        if (tokenCalculateStrategy == STRATEGY_DIRECT) {
+            if (controlBehavior == BEHAVIOR_REJECT) {
+                // 判断时间窗口
+                if (standard_metadata.ingress_global_timestamp - start_timestamp >= statIntervalInMs) {
+                    // 报告数据
+                    reported_data data;
+                    data.passed = passed_count;
+                    data.blocked = blocked_count;
+                    digest<reported_data>(1, data);
+
+                    passed_count = 0;
+                    blocked_count = 0;
+                    passed.write(id, passed_count);
+                    blocked.write(id, blocked_count);
+                    timestamp.write(id, standard_metadata.ingress_global_timestamp);
+                }
+
+                // 判断阈值
+                if (passed_count < threshold) {
+                    passed.write(id, passed_count + 1);
+                } else {
+                    blocked.write(id, blocked_count + 1);
+                    mark_to_drop(standard_metadata);
+                }
+            }
+        } else if (tokenCalculateStrategy == STRATEGY_WARM_UP) {
+            // 预热/冷启动
+            threshold_t real_threshold;
+            warm_up_threshold.read(real_threshold, id);
+
+            // 获取每个阈值提升需要的秒数
+            timestamp_t ms_per_threshold;
+            warm_up_ms_per_threshold.read(ms_per_threshold, id);
+
+            // 获取真实阈值更新的时间
+            timestamp_t update_timestamp;
+            warm_up_update_timestamp.read(update_timestamp, id);
+
+            if (update_timestamp == 0) {
+                // 当第一个数据包进来的时候，触发预热开始
+                warm_up_update_timestamp.write(id, standard_metadata.ingress_global_timestamp);
+
+                // 基础阈值 = 设定阈值 / 2 ** 预热因子
+                threshold_t base_threshold;
+                base_threshold = threshold >> (bit<8>) warmUpColdFactor;
+                warm_up_threshold.write(id, base_threshold);
+                real_threshold = base_threshold;
+            } else {
+                // 每次数据包进来，都判断超出触发阈值更新的时间了吗，超过就上调一次阈值
+                timestamp_t timestamp_diff;
+                timestamp_diff = standard_metadata.ingress_global_timestamp - update_timestamp;
+                if (timestamp_diff >= ms_per_threshold && real_threshold < threshold) {
+                    warm_up_update_timestamp.write(id, standard_metadata.ingress_global_timestamp);
+                    warm_up_threshold.write(id, real_threshold + 1);
+
+                    // 每次调整阈值，记录一下
+                    warm_up_data data;
+                    data.threshold = real_threshold + 1;
+                    data.passed = passed_count;
+                    data.blocked = blocked_count;
+                    digest<warm_up_data>(1, data);
+                }
+            }
+
+            // 判断时间窗口
+            if (standard_metadata.ingress_global_timestamp - start_timestamp >= statIntervalInMs) {
+                // 报告数据
+                warm_up_data data;
+                data.threshold = real_threshold;
+                data.passed = passed_count;
+                data.blocked = blocked_count;
+                digest<warm_up_data>(1, data);
+
+                passed_count = 0;
+                blocked_count = 0;
+                passed.write(id, passed_count);
+                blocked.write(id, blocked_count);
+                timestamp.write(id, standard_metadata.ingress_global_timestamp);
+            }
+
+            // 判断阈值
+            if (passed_count < real_threshold) {
+                passed.write(id, passed_count + 1);
+            } else {
+                blocked.write(id, blocked_count + 1);
+                mark_to_drop(standard_metadata);
+            }
+        }
+    }
+
     // 在 SAFE 缓解状态下，此表适用于所有数据包。
     // 在 ACTIVE 和 COOLDOWN 状态下，此表仅适用于被视为合法的数据包。
     table ipv4_lpm {
@@ -79,6 +187,19 @@ control MyIngress(inout headers hdr,
         }
         size = 1024;
         default_action = get_entropy_term(0);
+    }
+
+    table rule_tbl {
+        key = {
+            hdr.ipv4.dstAddr: exact;
+        }
+        actions = {
+            flow_control;
+            drop;
+            NoAction;
+        }
+        size = 1024;
+        default_action = NoAction();
     }
 
     apply {
@@ -421,8 +542,6 @@ control MyIngress(inout headers hdr,
             // -------------------------------- 目的地址频率和熵范数估计的结束 --------------------------------
 
             // -------------------------------- 异常检测的开始 --------------------------------
-            // Step 2: If the OW has ended, estimate the entropies.
-            // Step 3: If we detect an entropy anomaly, signal this condition. Otherwise, just update the moving averages.
 
             // 步骤 1：检查观察窗口是否结束
 
@@ -459,8 +578,7 @@ control MyIngress(inout headers hdr,
                     meta.dstEWMA = meta.dstEntropy << 14;
                     meta.srcEWMMD = 0;
                     meta.dstEWMMD = 0;
-
-                    } else {
+                } else {
                     meta.alarm = 0;
 
                     // ====== 步骤 3：如果检测到熵异常，则发出信号。否则，仅更新移动平均值
@@ -629,6 +747,8 @@ control MyIngress(inout headers hdr,
             } else {
                 ipv4_lpm.apply();      // 使用常规转发表
             }
+
+            rule_tbl.apply();  // 应用流控表
         }
     }
 } // Ingress end
